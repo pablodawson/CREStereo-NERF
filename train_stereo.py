@@ -154,7 +154,7 @@ def train(args):
 
     model.cuda()
     model.train()
-    model.module.freeze_bn() # We keep BatchNorm frozen
+    model.freeze_bn() # We keep BatchNorm frozen
 
     validation_frequency = 10000
 
@@ -292,7 +292,7 @@ if __name__ == '__main__':
     
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s')
-    
+
     Path("checkpoints").mkdir(exist_ok=True, parents=True)
 
     train(args)
