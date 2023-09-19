@@ -169,7 +169,7 @@ def train(args):
             image1, image2 = data_blob['im1_forward'].cuda(), data_blob['im2_forward'].cuda()
 
             assert model.training
-            flow_predictions = - model(image1, image2, iters=args.train_iters)
+            flow_predictions = model(image1, image2, iters=args.train_iters)
             assert model.training
 
             loss = torch.zeros(1).cuda()
@@ -180,13 +180,13 @@ def train(args):
                 '5px': 0.,
             }
             if nb:
-                bi_flow_predictions = [x[:nb] for x in flow_predictions]
+                bi_flow_predictions = [-x[:nb] for x in flow_predictions]
                 bi_loss, bi_metrics = sequence_loss(bi_flow_predictions, data_blob['bi']['flow'].cuda(), data_blob['bi']['valid'].cuda())
                 loss += bi_loss * nb
                 for k in metrics:
                     metrics[k] += bi_metrics[k] * nb
             if nt:
-                tri_flow_predictions = [x[nb:] for x in flow_predictions]
+                tri_flow_predictions = [-x[nb:] for x in flow_predictions]
                 tri_loss, tri_metrics = ns_loss(tri_flow_predictions, data_blob['tri']['flow'].cuda(), data_blob['tri']['conf'].cuda(), \
                                                 data_blob['tri']['im0'].cuda(), data_blob['tri']['im1'].cuda(), data_blob['tri']['im2'].cuda(), \
                                                 args.trinocular_loss, args.alpha_disp_loss, args.alpha_photometric, args.conf_threshold)
@@ -296,3 +296,5 @@ if __name__ == '__main__':
     Path("checkpoints").mkdir(exist_ok=True, parents=True)
 
     train(args)
+
+    python train_stereo.py --datapath=/workspace/nerf --training_file=/workspace/nerf/trainingQ.txt
