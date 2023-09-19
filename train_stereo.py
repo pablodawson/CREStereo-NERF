@@ -170,6 +170,7 @@ def train(args):
 
             assert model.training
             flow_predictions = model(image1, image2, iters=args.train_iters)
+            flow_predictions = [-x[:,0:1,:,:] for x in flow_predictions]
             assert model.training
 
             loss = torch.zeros(1).cuda()
@@ -246,7 +247,7 @@ if __name__ == '__main__':
     parser.add_argument('--name', default='nerf-supervised-raft-stereo', help="name your experiment")
     parser.add_argument('--restore_ckpt', help="restore checkpoint", default = "models/crestereo_eth3d.pth")
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
-    
+
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=2, help="batch size used during training.")
     parser.add_argument('--train_datasets', nargs='+', default=['3nerf'], help="training datasets.")
