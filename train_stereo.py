@@ -297,4 +297,4 @@ if __name__ == '__main__':
 
     train(args)
 
-    python train_stereo.py --datapath=/workspace/nerf --training_file=/workspace/nerf/trainingQ.txt
+    #python train_stereo.py --datapath=/workspace/nerf --training_file=/workspace/nerf/trainingQ.txt
