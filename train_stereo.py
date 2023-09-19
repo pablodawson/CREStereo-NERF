@@ -244,9 +244,9 @@ def train(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--name', default='nerf-supervised-raft-stereo', help="name your experiment")
-    parser.add_argument('--restore_ckpt', help="restore checkpoint")
+    parser.add_argument('--restore_ckpt', help="restore checkpoint", default = "models/crestereo_eth3d.pth")
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
-
+    
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=2, help="batch size used during training.")
     parser.add_argument('--train_datasets', nargs='+', default=['3nerf'], help="training datasets.")
@@ -257,7 +257,7 @@ if __name__ == '__main__':
     parser.add_argument('--wdecay', type=float, default=.00001, help="Weight decay in optimizer.")
 
     # Validation parameters
-    parser.add_argument('--valid_iters', type=int, default=32, help='number of flow-field updates during validation forward pass')
+    parser.add_argument('--valid_iters', type=int, default=20, help='number of flow-field updates during validation forward pass')
 
     # Architecure choices
     parser.add_argument('--corr_implementation', choices=["reg", "alt", "reg_cuda", "alt_cuda"], default="reg", help="correlation volume implementation")
@@ -278,8 +278,8 @@ if __name__ == '__main__':
     parser.add_argument('--noyjitter', action='store_true', help='don\'t simulate imperfect rectification')
 
     # NeRF-Stero parameters
-    parser.add_argument('--datapath', default='datasets/NeRF-Stereo/training_set', help="dataset root path")
-    parser.add_argument('--training_file', default='datasets/NeRF-Stereo/trainingQ.txt', help="list of training samples")
+    parser.add_argument('--datapath', default='/workspace/nerf/', help="dataset root path")
+    parser.add_argument('--training_file', default='/workspace/nerf/trainingQ.txt', help="list of training samples")
     parser.add_argument('--conf_threshold', type=float, default=0.5, help="threshold of AO")
     parser.add_argument('--disp_threshold', type=int, default=512, help="max disp")
     parser.add_argument('--trinocular_loss', default=True, help="use stereo triplet")
