@@ -10,7 +10,9 @@ from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from core.raft_stereo import RAFTStereo
+
+from nets import Model
+
 
 from evaluate_stereo import *
 import core.stereo_datasets as datasets
@@ -132,7 +134,10 @@ class Logger:
 
 def train(args):
 
-    model = nn.DataParallel(RAFTStereo(args))
+    # model / optimizer
+    model = Model(
+        max_disp=args.disp_threshold, mixed_precision=args.mixed_precision, test_mode=False
+    )
     print("Parameter Count: %d" % count_parameters(model))
 
     train_loader = datasets.fetch_dataloader(args)
@@ -164,7 +169,7 @@ def train(args):
             image1, image2 = data_blob['im1_forward'].cuda(), data_blob['im2_forward'].cuda()
 
             assert model.training
-            flow_predictions = model(image1, image2, iters=args.train_iters)
+            flow_predictions = - model(image1, image2, iters=args.train_iters)
             assert model.training
 
             loss = torch.zeros(1).cuda()
@@ -287,7 +292,7 @@ if __name__ == '__main__':
     
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s')
-
+    
     Path("checkpoints").mkdir(exist_ok=True, parents=True)
 
     train(args)
