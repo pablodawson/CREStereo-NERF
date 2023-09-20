@@ -216,12 +216,12 @@ def train(args):
                 logging.info(f"Saving file {save_path.absolute()}")
                 torch.save(model.state_dict(), save_path)
 
-                results = validate_kitti(model.module, iters=args.valid_iters)
-
+                results = validate_kitti(model, iters=args.valid_iters)
+                
                 logger.write_dict(results)
 
                 model.train()
-                model.module.freeze_bn()
+                model.freeze_bn()
 
             total_steps += 1
 
@@ -245,7 +245,7 @@ def train(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--name', default='nerf-supervised-raft-stereo', help="name your experiment")
-    parser.add_argument('--restore_ckpt', help="restore checkpoint", default = "models/crestereo_eth3d.pth")
+    parser.add_argument('--restore_ckpt', help="restore checkpoint", )
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
 
     # Training parameters
@@ -253,7 +253,7 @@ if __name__ == '__main__':
     parser.add_argument('--train_datasets', nargs='+', default=['3nerf'], help="training datasets.")
     parser.add_argument('--lr', type=float, default=0.0002, help="max learning rate.")
     parser.add_argument('--num_steps', type=int, default=200000, help="length of training schedule.")
-    parser.add_argument('--image_size', type=int, nargs='+', default=[384, 768], help="size of the random image crops used during training.")
+    parser.add_argument('--image_size', type=int, nargs='+', default=[256, 512], help="size of the random image crops used during training.")
     parser.add_argument('--train_iters', type=int, default=16, help="number of updates to the disparity field in each forward pass.")
     parser.add_argument('--wdecay', type=float, default=.00001, help="Weight decay in optimizer.")
 
