@@ -10,8 +10,12 @@ from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.nn as nn
 import torch.optim as optim
-
+from itertools import repeat
+import os
 from nets import Model
+
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 from evaluate_stereo import *
@@ -132,6 +136,11 @@ class Logger:
         self.writer.close()
 
 
+def repeater(data_loader):
+    for loader in repeat(data_loader):
+        for data in loader:
+            yield data
+
 def train(args):
 
     # model / optimizer
@@ -144,20 +153,22 @@ def train(args):
     print("Parameter Count: %d" % count_parameters(model))
 
     train_loader = datasets.fetch_dataloader(args)
+    train_loader = repeater(train_loader)
+    
     optimizer, scheduler = fetch_optimizer(args, model)
     total_steps = 0
     logger = Logger(model, scheduler)
-
+    
     if args.restore_ckpt is not None:
         assert args.restore_ckpt.endswith(".pth")
         logging.info("Loading checkpoint...")
         checkpoint = torch.load(args.restore_ckpt)
-        model.load_state_dict(checkpoint, strict=True)
+        model.module.load_state_dict(checkpoint, strict=True)
         logging.info(f"Done loading checkpoint")
 
     model.cuda()
     model.train()
-    model.freeze_bn() # We keep BatchNorm frozen
+    model.module.freeze_bn() # We keep BatchNorm frozen
 
     validation_frequency = 10000
 
@@ -172,7 +183,7 @@ def train(args):
             image1, image2 = data_blob['im1_forward'].cuda(), data_blob['im2_forward'].cuda()
 
             assert model.training
-            flow_predictions = model(image1, image2, iters=args.train_iters)
+            flow_predictions =  model(image1, image2, iters=args.train_iters)
             flow_predictions = [-x[:,0:1,:,:] for x in flow_predictions]
             assert model.training
 
@@ -223,7 +234,7 @@ def train(args):
                 #logger.write_dict(results)
 
                 model.train()
-                model.freeze_bn()
+                model.module.freeze_bn()
 
             total_steps += 1
 
@@ -243,11 +254,169 @@ def train(args):
 
     return PATH
 
+def train_dist(args):
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--local_rank",type=int)
+    FLAGS = parser.parse_args()
+    local_rank = FLAGS.local_rank
+
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend='nccl')  # nccl is highly recommanded
+    # model / optimizer
+    model = Model(
+        max_disp=args.disp_threshold, mixed_precision=args.mixed_precision, test_mode=False
+    )
+
+    # sync batch norm
+    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(local_rank)
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+    optimizer, scheduler = fetch_optimizer(args, model)
+
+    if dist.get_rank() == 0:
+        world_size = torch.cuda.device_count()  # number of GPU(s)
+        # tensorboard
+        tb_log = SummaryWriter(os.path.join(args.log_dir, "train.events"))
+
+        # worklog
+        logging.basicConfig(level=eval(args.log_level))
+        worklog = logging.getLogger("train_logger")
+        worklog.propagate = False
+        fileHandler = logging.FileHandler(
+            os.path.join(args.log_dir, "worklog.txt"), mode="a", encoding="utf8"
+        )
+        formatter = logging.Formatter(
+            fmt="%(asctime)s %(message)s", datefmt="%Y/%m/%d %H:%M:%S"
+        )
+        fileHandler.setFormatter(formatter)
+        consoleHandler = logging.StreamHandler(sys.stdout)
+        formatter = logging.Formatter(
+            fmt="\x1b[32m%(asctime)s\x1b[0m %(message)s", datefmt="%Y/%m/%d %H:%M:%S"
+        )
+        consoleHandler.setFormatter(formatter)
+        worklog.handlers = [fileHandler, consoleHandler]
+
+        # params stat
+        worklog.info(f"Use {world_size} GPU(s)")
+        worklog.info("Params: %s" % sum([p.numel() for p in model.parameters()]))
+    
+    
+    dataset = datasets.fetch_dataloader(args)
+    
+    total_steps = 0
+
+    if dist.get_rank() == 0:
+        worklog.info(f"Dataset size: {len(dataset)}")
+
+    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+
+    dataloader = torch.utils.data.DataLoader(dataset, 
+        batch_size=args.batch_size, num_workers=4, sampler=train_sampler)
+
+    #logger = Logger(model, scheduler)
+    
+    if args.restore_ckpt is not None:
+        assert args.restore_ckpt.endswith(".pth")
+        logging.info("Loading checkpoint...")
+        checkpoint = torch.load(args.restore_ckpt)
+        model.module.load_state_dict(checkpoint, strict=True)
+        logging.info(f"Done loading checkpoint")
+
+    #model.cuda()
+    model.train()
+    #model.module.freeze_bn() # We keep BatchNorm frozen
+    
+    validation_frequency = 10000
+
+    scaler = GradScaler(enabled=args.mixed_precision)
+
+    should_keep_training = True
+    global_batch_num = 0
+    #dataloader.sampler.set_epoch(0)
+
+    while should_keep_training:
+
+        for i_batch, (data_blob, nb, nt) in enumerate(tqdm(dataloader)):
+            optimizer.zero_grad()
+            image1, image2 = data_blob['im1_forward'].to(local_rank), data_blob['im2_forward'].to(local_rank)
+            assert model.training
+            flow_predictions =  model(image1, image2, iters=args.train_iters)
+            flow_predictions = [-x[:,0:1,:,:] for x in flow_predictions]
+            assert model.training
+
+            loss = torch.zeros(1).to(local_rank)
+            metrics = {
+                'epe': 0.,
+                '1px': 0.,
+                '3px': 0.,
+                '5px': 0.,
+            }
+            if nb:
+                bi_flow_predictions = [x[:nb] for x in flow_predictions]
+                bi_loss, bi_metrics = sequence_loss(bi_flow_predictions, data_blob['bi']['flow'].to(local_rank), data_blob['bi']['valid'].to(local_rank))
+                loss += bi_loss * nb
+                for k in metrics:
+                    metrics[k] += bi_metrics[k] * nb
+            if nt:
+                tri_flow_predictions = [x[nb:] for x in flow_predictions]
+                tri_loss, tri_metrics = ns_loss(tri_flow_predictions, data_blob['tri']['flow'].to(local_rank), data_blob['tri']['conf'].to(local_rank), \
+                                                data_blob['tri']['im0'].to(local_rank), data_blob['tri']['im1'].to(local_rank), data_blob['tri']['im2'].to(local_rank), \
+                                                args.trinocular_loss, args.alpha_disp_loss, args.alpha_photometric, args.conf_threshold)
+                loss += tri_loss * nt
+                for k in metrics:
+                    metrics[k] += tri_metrics[k] * nt
+            loss /= nb + nt
+            for k in metrics:
+                metrics[k] /= nb + nt
+
+            tb_log.writer.add_scalar("live_loss", loss.item(), global_batch_num)
+            tb_log.writer.add_scalar(f'learning_rate', optimizer.param_groups[0]['lr'], global_batch_num)
+            global_batch_num += 1
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+            scaler.step(optimizer)
+            scheduler.step()
+            scaler.update()
+
+            tb_log.push(metrics)
+
+            if total_steps % validation_frequency == validation_frequency - 1:
+                save_path = Path('checkpoints/%d_%s.pth' % (total_steps + 1, args.name))
+                logging.info(f"Saving file {save_path.absolute()}")
+                torch.save(model.state_dict(), save_path)
+
+                #results = validate_kitti(model, iters=args.valid_iters)
+                #logger.write_dict(results)
+
+                model.train()
+                model.module.freeze_bn()
+
+            total_steps += 1
+
+            if total_steps > args.num_steps:
+                should_keep_training = False
+                break
+
+        if len(dataset) >= 10000:
+            save_path = Path('checkpoints/%d_epoch_%s.pth.gz' % (total_steps + 1, args.name))
+            logging.info(f"Saving file {save_path}")
+            torch.save(model.state_dict(), save_path)
+
+    print("FINISHED TRAINING")
+    tb_log.close()
+    PATH = 'checkpoints/%s.pth' % args.name
+    torch.save(model.state_dict(), PATH)
+
+    return PATH
+
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--name', default='nerf-supervised-raft-stereo', help="name your experiment")
-    parser.add_argument('--restore_ckpt', help="restore checkpoint", )
+    parser.add_argument('--restore_ckpt', help="restore checkpoint")
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
 
     # Training parameters
@@ -281,10 +450,10 @@ if __name__ == '__main__':
     parser.add_argument('--noyjitter', action='store_true', help='don\'t simulate imperfect rectification')
 
     # NeRF-Stero parameters
-    parser.add_argument('--datapath', default='/workspace/nerf/', help="dataset root path")
-    parser.add_argument('--training_file', default='/workspace/nerf/trainingQ.txt', help="list of training samples")
+    parser.add_argument('--datapath', default='F:/Datasets/NerfSupervised', help="dataset root path")
+    parser.add_argument('--training_file', default='trainingQ.txt', help="list of training samples")
     parser.add_argument('--conf_threshold', type=float, default=0.5, help="threshold of AO")
-    parser.add_argument('--disp_threshold', type=int, default=512, help="max disp")
+    parser.add_argument('--disp_threshold', type=int, default=256, help="max disp")
     parser.add_argument('--trinocular_loss', default=True, help="use stereo triplet")
     parser.add_argument('--alpha_disp_loss', type=float, default=1.0, help="weight of disparity loss")
     parser.add_argument('--alpha_photometric', type=float, default=0.1, help="weight of photometric loss")
@@ -298,6 +467,7 @@ if __name__ == '__main__':
 
     Path("checkpoints").mkdir(exist_ok=True, parents=True)
 
-    train(args)
+    #train(args)
+    train_dist(args)
 
     #python train_stereo.py --datapath=/workspace/nerf --training_file=/workspace/nerf/trainingQ.txt
