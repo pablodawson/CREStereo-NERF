@@ -14,13 +14,14 @@ from itertools import repeat
 import os
 from nets import Model
 
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-
 
 from evaluate_stereo import *
 import core.stereo_datasets as datasets
 from core.ns_loss import ns_loss
+
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 
 try:
     from torch.cuda.amp import GradScaler
@@ -255,11 +256,7 @@ def train(args):
     return PATH
 
 def train_dist(args):
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--local_rank",type=int)
-    FLAGS = parser.parse_args()
-    local_rank = FLAGS.local_rank
+    local_rank = args.local_rank
 
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend='nccl')  # nccl is highly recommanded
@@ -273,47 +270,13 @@ def train_dist(args):
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     optimizer, scheduler = fetch_optimizer(args, model)
 
-    if dist.get_rank() == 0:
-        world_size = torch.cuda.device_count()  # number of GPU(s)
-        # tensorboard
-        tb_log = SummaryWriter(os.path.join(args.log_dir, "train.events"))
-
-        # worklog
-        logging.basicConfig(level=eval(args.log_level))
-        worklog = logging.getLogger("train_logger")
-        worklog.propagate = False
-        fileHandler = logging.FileHandler(
-            os.path.join(args.log_dir, "worklog.txt"), mode="a", encoding="utf8"
-        )
-        formatter = logging.Formatter(
-            fmt="%(asctime)s %(message)s", datefmt="%Y/%m/%d %H:%M:%S"
-        )
-        fileHandler.setFormatter(formatter)
-        consoleHandler = logging.StreamHandler(sys.stdout)
-        formatter = logging.Formatter(
-            fmt="\x1b[32m%(asctime)s\x1b[0m %(message)s", datefmt="%Y/%m/%d %H:%M:%S"
-        )
-        consoleHandler.setFormatter(formatter)
-        worklog.handlers = [fileHandler, consoleHandler]
-
-        # params stat
-        worklog.info(f"Use {world_size} GPU(s)")
-        worklog.info("Params: %s" % sum([p.numel() for p in model.parameters()]))
     
     
-    dataset = datasets.fetch_dataloader(args)
+    dataloader = datasets.fetch_dataloader(args, distributed=True)
     
     total_steps = 0
-
-    if dist.get_rank() == 0:
-        worklog.info(f"Dataset size: {len(dataset)}")
-
-    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-
-    dataloader = torch.utils.data.DataLoader(dataset, 
-        batch_size=args.batch_size, num_workers=4, sampler=train_sampler)
-
-    #logger = Logger(model, scheduler)
+    
+    logger = Logger(model, scheduler)
     
     if args.restore_ckpt is not None:
         assert args.restore_ckpt.endswith(".pth")
@@ -332,7 +295,7 @@ def train_dist(args):
 
     should_keep_training = True
     global_batch_num = 0
-    #dataloader.sampler.set_epoch(0)
+    dataloader.sampler.set_epoch(0)
 
     while should_keep_training:
 
@@ -369,61 +332,61 @@ def train_dist(args):
             for k in metrics:
                 metrics[k] /= nb + nt
 
-            tb_log.writer.add_scalar("live_loss", loss.item(), global_batch_num)
-            tb_log.writer.add_scalar(f'learning_rate', optimizer.param_groups[0]['lr'], global_batch_num)
+            if dist.get_rank() == 0:
+                logger.writer.add_scalar("live_loss", loss.item(), global_batch_num)
+                logger.writer.add_scalar(f'learning_rate', optimizer.param_groups[0]['lr'], global_batch_num)
+                logger.push(metrics)
+            
             global_batch_num += 1
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
+            
             scaler.step(optimizer)
             scheduler.step()
             scaler.update()
 
-            tb_log.push(metrics)
-
-            if total_steps % validation_frequency == validation_frequency - 1:
-                save_path = Path('checkpoints/%d_%s.pth' % (total_steps + 1, args.name))
-                logging.info(f"Saving file {save_path.absolute()}")
-                torch.save(model.state_dict(), save_path)
-
-                #results = validate_kitti(model, iters=args.valid_iters)
-                #logger.write_dict(results)
-
-                model.train()
-                model.module.freeze_bn()
-
-            total_steps += 1
+            if dist.get_rank() == 0:
+                if total_steps % validation_frequency == validation_frequency - 1:
+                    save_path = Path('checkpoints/%d_%s.pth' % (total_steps + 1, args.name))
+                    logging.info(f"Saving file {save_path.absolute()}")
+                    torch.save(model.state_dict(), save_path)
+    
+                    #results = validate_kitti(model, iters=args.valid_iters)
+                    #logger.write_dict(results)
+                    
+                    model.train()
+    
+                total_steps += 1
 
             if total_steps > args.num_steps:
                 should_keep_training = False
                 break
-
-        if len(dataset) >= 10000:
+        
+        if len(dataloader) >= 10000:
             save_path = Path('checkpoints/%d_epoch_%s.pth.gz' % (total_steps + 1, args.name))
             logging.info(f"Saving file {save_path}")
-            torch.save(model.state_dict(), save_path)
-
+            torch.save(model.module.state_dict(), save_path)
+    
     print("FINISHED TRAINING")
-    tb_log.close()
+    logger.close()
     PATH = 'checkpoints/%s.pth' % args.name
-    torch.save(model.state_dict(), PATH)
+    torch.save(model.module.state_dict(), PATH)
 
     return PATH
-
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--name', default='nerf-supervised-raft-stereo', help="name your experiment")
-    parser.add_argument('--restore_ckpt', help="restore checkpoint")
+    parser.add_argument('--restore_ckpt', help="restore checkpoint", default = "models/crestereo_eth3d.pth")
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
 
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=2, help="batch size used during training.")
     parser.add_argument('--train_datasets', nargs='+', default=['3nerf'], help="training datasets.")
     parser.add_argument('--lr', type=float, default=0.0002, help="max learning rate.")
-    parser.add_argument('--num_steps', type=int, default=200000, help="length of training schedule.")
+    parser.add_argument('--num_steps', type=int, default=150000, help="length of training schedule.")
     parser.add_argument('--image_size', type=int, nargs='+', default=[384, 768], help="size of the random image crops used during training.")
     parser.add_argument('--train_iters', type=int, default=16, help="number of updates to the disparity field in each forward pass.")
     parser.add_argument('--wdecay', type=float, default=.00001, help="Weight decay in optimizer.")
@@ -450,13 +413,16 @@ if __name__ == '__main__':
     parser.add_argument('--noyjitter', action='store_true', help='don\'t simulate imperfect rectification')
 
     # NeRF-Stero parameters
-    parser.add_argument('--datapath', default='F:/Datasets/NerfSupervised', help="dataset root path")
-    parser.add_argument('--training_file', default='trainingQ.txt', help="list of training samples")
+    parser.add_argument('--datapath', default='/workspace/nerf/', help="dataset root path")
+    parser.add_argument('--training_file', default='/workspace/nerf/trainingQ.txt', help="list of training samples")
     parser.add_argument('--conf_threshold', type=float, default=0.5, help="threshold of AO")
     parser.add_argument('--disp_threshold', type=int, default=256, help="max disp")
     parser.add_argument('--trinocular_loss', default=True, help="use stereo triplet")
     parser.add_argument('--alpha_disp_loss', type=float, default=1.0, help="weight of disparity loss")
     parser.add_argument('--alpha_photometric', type=float, default=0.1, help="weight of photometric loss")
+
+    parser.add_argument("--local-rank",type=int)
+    
     args = parser.parse_args()
 
     torch.manual_seed(1234)

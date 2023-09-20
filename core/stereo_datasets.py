@@ -390,7 +390,7 @@ class NS_Data(data.Dataset):
         return data, nb, nt
 
 
-def fetch_dataloader(args):
+def fetch_dataloader(args, distributed=False):
     """ Create the data loader for the corresponding trainign set """
 
     aug_params = {'crop_size': args.image_size, 'min_scale': args.spatial_scale[0], 'max_scale': args.spatial_scale[1], 'do_flip': False, 'yjitter': not args.noyjitter}
@@ -429,9 +429,14 @@ def fetch_dataloader(args):
                 aug_params=ns_aug_params
             )
         train_dataset = new_dataset if train_dataset is None else train_dataset + new_dataset
-
-    train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, 
-        pin_memory=True, shuffle=True, num_workers=int(os.environ.get('SLURM_CPUS_PER_TASK', 6))-2, collate_fn=NS_Data.collate_fn, drop_last=True)
+    
+    if (distributed):
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, 
+            pin_memory=True, shuffle=True, num_workers=int(os.environ.get('SLURM_CPUS_PER_TASK', 6))-2, collate_fn=NS_Data.collate_fn, drop_last=True, sampler=train_sampler)
+    else:
+        train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, 
+            pin_memory=True, shuffle=True, num_workers=int(os.environ.get('SLURM_CPUS_PER_TASK', 6))-2, collate_fn=NS_Data.collate_fn, drop_last=True)
 
     logging.info('Training with %d image pairs' % len(train_dataset))
     return train_loader
