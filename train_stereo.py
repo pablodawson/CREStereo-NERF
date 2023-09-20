@@ -138,6 +138,9 @@ def train(args):
     model = Model(
         max_disp=args.disp_threshold, mixed_precision=args.mixed_precision, test_mode=False
     )
+    world_size = torch.cuda.device_count()
+    model = nn.DataParallel(model,device_ids=[i for i in range(world_size)])
+    
     print("Parameter Count: %d" % count_parameters(model))
 
     train_loader = datasets.fetch_dataloader(args)
